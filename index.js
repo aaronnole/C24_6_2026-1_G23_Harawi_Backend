@@ -36,6 +36,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Configuración de Multer (Almacenamiento temporal en memoria para procesar con storageService)
 const upload = multer({ storage: multer.memoryStorage() });
+const activeMusicalArchiveUploads = new Set();
 
 // Endpoint de Registro
 app.post('/api/register', async (req, res) => {
@@ -528,6 +529,8 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
  * Endpoint para subir archivos musicales (musical_archives)
  */
 app.post('/api/musical-archives', upload.fields([{ name: 'archive', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
+  let uploadKey = null;
+
   try {
     const { user_id, archive_name, description, privacy, genre_id, tags } = req.body;
 
@@ -541,6 +544,13 @@ app.post('/api/musical-archives', upload.fields([{ name: 'archive', maxCount: 1 
 
     const archiveFile = req.files.archive[0];
     const thumbnailFile = req.files.thumbnail ? req.files.thumbnail[0] : null;
+    uploadKey = `${user_id}:${archiveFile.originalname}:${archiveFile.size}`;
+
+    if (activeMusicalArchiveUploads.has(uploadKey)) {
+      return res.status(409).json({ message: 'Este archivo ya se esta subiendo. Espera a que termine la subida actual.' });
+    }
+
+    activeMusicalArchiveUploads.add(uploadKey);
 
     // Determinar archive_type
     let archive_type = 'AUDIO';
@@ -664,6 +674,10 @@ app.post('/api/musical-archives', upload.fields([{ name: 'archive', maxCount: 1 
     }
     console.error('Error subiendo archivo musical:', error);
     res.status(500).json({ message: 'Error interno del servidor', error: error.message });
+  } finally {
+    if (uploadKey) {
+      activeMusicalArchiveUploads.delete(uploadKey);
+    }
   }
 });
 
@@ -703,6 +717,7 @@ app.get('/api/projects/user/:user_id', async (req, res) => {
          LIMIT 1
        ) ma ON TRUE
        WHERE p.user_id = $1
+         AND p.deleted_date IS NULL
        ORDER BY p.project_id DESC`,
       [user_id]
     );
@@ -711,6 +726,46 @@ app.get('/api/projects/user/:user_id', async (req, res) => {
   } catch (error) {
     console.error('Error obteniendo proyectos del usuario:', error);
     res.status(500).json({ message: 'Error interno del servidor' });
+  }
+});
+
+/**
+ * Soft delete de proyecto
+ */
+app.delete('/api/projects/:project_id', async (req, res) => {
+  const { project_id } = req.params;
+  const { user_id } = req.body || {};
+
+  const projectId = Number(project_id);
+  const ownerId = Number(user_id);
+
+  if (!Number.isInteger(projectId) || !Number.isInteger(ownerId)) {
+    return res.status(400).json({ message: 'project_id y user_id deben ser números válidos' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE projects
+       SET deleted_date = NOW()
+       WHERE project_id = $1
+         AND user_id = $2
+         AND deleted_date IS NULL
+       RETURNING project_id`,
+      [projectId, ownerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Proyecto no encontrado o ya eliminado' });
+    }
+
+    return res.status(200).json({
+      message: 'Proyecto eliminado correctamente',
+      project_id: result.rows[0].project_id,
+      deleted: true,
+    });
+  } catch (error) {
+    console.error('Error eliminando proyecto:', error);
+    return res.status(500).json({ message: 'Error interno del servidor', error: error.message });
   }
 });
 
@@ -740,6 +795,7 @@ app.get('/api/videos/recommended', async (req, res) => {
          LIMIT 1
        ) ma ON TRUE
        WHERE ma.archive_type IN ('AUDIO', 'VIDEO')
+         AND p.deleted_date IS NULL
        ORDER BY RANDOM()
        LIMIT $1`,
       [safeLimit]
@@ -781,6 +837,7 @@ app.get('/api/videos/recent', async (req, res) => {
          LIMIT 1
        ) ma ON TRUE
        WHERE ma.archive_type IN ('AUDIO', 'VIDEO')
+         AND p.deleted_date IS NULL
        ORDER BY p.creation_date DESC, p.project_id DESC
        LIMIT $1`,
       [safeLimit]
@@ -1076,6 +1133,7 @@ app.get('/api/video-detail/:project_id', async (req, res) => {
          LIMIT 1
        ) ma ON TRUE
        WHERE p.project_id = $1
+         AND p.deleted_date IS NULL
        LIMIT 1`,
       [project_id]
     );
