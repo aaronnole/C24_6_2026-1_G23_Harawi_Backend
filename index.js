@@ -38,6 +38,153 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 const upload = multer({ storage: multer.memoryStorage() });
 const activeMusicalArchiveUploads = new Set();
 
+function parseCollaboratorIds(rawCollaborators) {
+  if (!rawCollaborators) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(rawCollaborators);
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed
+      .map((value) => Number(value))
+      .filter((value, index, array) => Number.isInteger(value) && value > 0 && array.indexOf(value) === index);
+  } catch {
+    return [];
+  }
+}
+
+async function addCollaboratorsToProject(projectId, ownerUserId, collaboratorUserIds) {
+  if (!Array.isArray(collaboratorUserIds) || collaboratorUserIds.length === 0) {
+    return [];
+  }
+
+  const followersResult = await pool.query(
+    `SELECT u.user_id, u.username
+     FROM user_follows uf
+     JOIN users u ON u.user_id = uf.follower_id
+     WHERE uf.following_id = $1
+       AND uf.follower_id = ANY($2::int[])`,
+    [ownerUserId, collaboratorUserIds]
+  );
+
+  if (followersResult.rows.length !== collaboratorUserIds.length) {
+    throw new Error('Solo puedes agregar colaboradores que sean seguidores tuyos.');
+  }
+
+  const followerMap = new Map(
+    followersResult.rows.map((row) => [row.user_id, row.username])
+  );
+
+  const linkedCollaborators = [];
+
+  for (const collaboratorUserId of collaboratorUserIds) {
+    const collaboratorName = followerMap.get(collaboratorUserId);
+    const existingCollaborator = await pool.query(
+      `SELECT collaborator_id, name, creation_date
+       FROM collaborators
+       WHERE LOWER(name) = LOWER($1)
+       LIMIT 1`,
+      [collaboratorName]
+    );
+
+    let collaborator = existingCollaborator.rows[0];
+
+    if (!collaborator) {
+      const collaboratorResult = await pool.query(
+        `INSERT INTO collaborators (name)
+         VALUES ($1)
+         RETURNING collaborator_id, name, creation_date`,
+        [collaboratorName]
+      );
+
+      collaborator = collaboratorResult.rows[0];
+    }
+
+    const relationResult = await pool.query(
+      `INSERT INTO project_collaborators (project_id, collaborator_id, status)
+       VALUES ($1, $2, 'PENDING')
+       RETURNING project_id, collaborator_id, status, invitation_date, response_date`,
+      [projectId, collaborator.collaborator_id]
+    );
+
+    await pool.query(
+      `INSERT INTO collaboration_notifications (project_id, collaborator_id, sender_user_id, recipient_user_id, status)
+       VALUES ($1, $2, $3, $4, 'PENDING')`,
+      [projectId, collaborator.collaborator_id, ownerUserId, collaboratorUserId]
+    );
+
+    linkedCollaborators.push({
+      ...relationResult.rows[0],
+      user_id: collaboratorUserId,
+      name: collaborator.name
+    });
+  }
+
+  return linkedCollaborators;
+}
+
+async function replaceProjectCollaborators(projectId, ownerUserId, collaboratorUserIds) {
+  await pool.query(
+    `DELETE FROM project_collaborators
+     WHERE project_id = $1`,
+    [projectId]
+  );
+
+  return addCollaboratorsToProject(projectId, ownerUserId, collaboratorUserIds);
+}
+
+async function replaceProjectTags(projectId, rawTags) {
+  const parsedTags = Array.isArray(rawTags)
+    ? rawTags.filter((tag) => typeof tag === 'string' && tag.trim() !== '')
+    : [];
+
+  await pool.query('DELETE FROM project_tags WHERE project_id = $1', [projectId]);
+
+  for (const rawTag of parsedTags) {
+    const normalizedTag = rawTag.trim().toLowerCase();
+    if (!normalizedTag) continue;
+
+    let tagId;
+    const existingTag = await pool.query(
+      'SELECT tag_id FROM tags WHERE LOWER(name) = LOWER($1) LIMIT 1',
+      [normalizedTag]
+    );
+
+    if (existingTag.rows.length > 0) {
+      tagId = existingTag.rows[0].tag_id;
+    } else {
+      const createdTag = await pool.query(
+        'INSERT INTO tags (name) VALUES ($1) RETURNING tag_id',
+        [normalizedTag]
+      );
+      tagId = createdTag.rows[0].tag_id;
+    }
+
+    await pool.query(
+      `INSERT INTO project_tags (project_id, tag_id)
+       VALUES ($1, $2)`,
+      [projectId, tagId]
+    );
+  }
+}
+
+function parseTags(rawTags) {
+  if (!rawTags) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(rawTags);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 // Endpoint de Registro
 app.post('/api/register', async (req, res) => {
   const {
@@ -532,7 +679,7 @@ app.post('/api/musical-archives', upload.fields([{ name: 'archive', maxCount: 1 
   let uploadKey = null;
 
   try {
-    const { user_id, archive_name, description, privacy, genre_id, tags } = req.body;
+    const { user_id, archive_name, description, privacy, genre_id, tags, collaborators } = req.body;
 
     if (!user_id) {
       return res.status(400).json({ message: 'user_id es obligatorio para subir un archivo musical' });
@@ -572,17 +719,9 @@ app.post('/api/musical-archives', upload.fields([{ name: 'archive', maxCount: 1 
       waveformUrl = await audioWaveformService.generateForUpload(archiveData);
     }
 
-    let parsedTags = [];
-    if (tags) {
-      try {
-        const parsed = JSON.parse(tags);
-        if (Array.isArray(parsed)) {
-          parsedTags = parsed.filter((t) => typeof t === 'string' && t.trim() !== '');
-        }
-      } catch {
-        parsedTags = [];
-      }
-    }
+    const parsedTags = parseTags(tags);
+
+    const parsedCollaborators = parseCollaboratorIds(collaborators);
 
     await pool.query('BEGIN');
 
@@ -612,35 +751,9 @@ app.post('/api/musical-archives', upload.fields([{ name: 'archive', maxCount: 1 
     const createdProjectId = projectResult.rows[0].project_id;
 
     // 3. Relacionar tags con el proyecto
-    for (const rawTag of parsedTags) {
-      const normalizedTag = rawTag.trim().toLowerCase();
-      if (!normalizedTag) continue;
+    await replaceProjectTags(createdProjectId, parsedTags);
 
-      let tagId;
-      const existingTag = await pool.query(
-        'SELECT tag_id FROM tags WHERE LOWER(name) = LOWER($1) LIMIT 1',
-        [normalizedTag]
-      );
-
-      if (existingTag.rows.length > 0) {
-        tagId = existingTag.rows[0].tag_id;
-      } else {
-        const createdTag = await pool.query(
-          'INSERT INTO tags (name) VALUES ($1) RETURNING tag_id',
-          [normalizedTag]
-        );
-        tagId = createdTag.rows[0].tag_id;
-      }
-
-      await pool.query(
-        `INSERT INTO project_tags (project_id, tag_id)
-         SELECT $1, $2
-         WHERE NOT EXISTS (
-           SELECT 1 FROM project_tags WHERE project_id = $1 AND tag_id = $2
-         )`,
-        [createdProjectId, tagId]
-      );
-    }
+    const linkedCollaborators = await addCollaboratorsToProject(createdProjectId, finalUserId, parsedCollaborators);
 
     // 4. Guardar archivo musical enlazado al proyecto
     const result = await pool.query(
@@ -663,7 +776,8 @@ app.post('/api/musical-archives', upload.fields([{ name: 'archive', maxCount: 1 
 
     res.status(201).json({
       message: 'Archivo musical subido exitosamente',
-      musical_archive: result.rows[0]
+      musical_archive: result.rows[0],
+      collaborators: linkedCollaborators
     });
 
   } catch (error) {
@@ -726,6 +840,257 @@ app.get('/api/projects/user/:user_id', async (req, res) => {
   } catch (error) {
     console.error('Error obteniendo proyectos del usuario:', error);
     res.status(500).json({ message: 'Error interno del servidor' });
+  }
+});
+
+app.get('/api/projects/:project_id/metadata', async (req, res) => {
+  const projectId = Number(req.params.project_id);
+  const viewerId = Number(req.query.user_id);
+
+  if (!Number.isInteger(projectId) || !Number.isInteger(viewerId)) {
+    return res.status(400).json({ message: 'project_id y user_id deben ser numeros validos' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         p.project_id,
+         p.user_id,
+         p.title,
+         p.description,
+         p.visibility,
+         p.genre_id,
+         ma.archive_name,
+         ma.thumbnail_url,
+         COALESCE((
+           SELECT json_agg(t.name ORDER BY t.name)
+           FROM project_tags pt
+           JOIN tags t ON t.tag_id = pt.tag_id
+           WHERE pt.project_id = p.project_id
+         ), '[]'::json) AS tags,
+         COALESCE((
+           SELECT json_agg(
+             json_build_object(
+               'user_id', u.user_id,
+               'username', COALESCE(u.username, c.name),
+               'status', pc.status
+             )
+             ORDER BY COALESCE(u.username, c.name)
+           )
+           FROM project_collaborators pc
+           JOIN collaborators c ON c.collaborator_id = pc.collaborator_id
+           LEFT JOIN users u ON LOWER(u.username) = LOWER(c.name)
+           WHERE pc.project_id = p.project_id
+         ), '[]'::json) AS collaborators
+       FROM projects p
+       JOIN musical_archives ma ON ma.project_id = p.project_id
+       WHERE p.project_id = $1
+         AND p.user_id = $2
+         AND p.deleted_date IS NULL
+       LIMIT 1`,
+      [projectId, viewerId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Proyecto no encontrado' });
+    }
+
+    return res.status(200).json(result.rows[0]);
+  } catch (error) {
+    console.error('Error obteniendo metadata del proyecto:', error);
+    return res.status(500).json({ message: 'Error interno del servidor', error: error.message });
+  }
+});
+
+app.put('/api/projects/:project_id/metadata', async (req, res) => {
+  const projectId = Number(req.params.project_id);
+  const {
+    user_id,
+    title,
+    description,
+    privacy,
+    genre_id,
+    tags,
+    collaborators,
+  } = req.body || {};
+
+  const ownerId = Number(user_id);
+  const finalGenreId = genre_id ? Number(genre_id) : null;
+  const collaboratorIds = Array.isArray(collaborators)
+    ? collaborators
+        .map((value) => Number(value))
+        .filter((value, index, array) => Number.isInteger(value) && value > 0 && array.indexOf(value) === index)
+    : [];
+  const finalTags = Array.isArray(tags) ? tags : [];
+  const finalVisibility = privacy === 'private' ? 'PRIVATE' : 'PUBLIC';
+
+  if (!Number.isInteger(projectId) || !Number.isInteger(ownerId)) {
+    return res.status(400).json({ message: 'project_id y user_id deben ser numeros validos' });
+  }
+
+  if (!String(title || '').trim()) {
+    return res.status(400).json({ message: 'El titulo es obligatorio' });
+  }
+
+  try {
+    await pool.query('BEGIN');
+
+    const updateProject = await pool.query(
+      `UPDATE projects
+       SET title = $1,
+           description = $2,
+           visibility = $3,
+           genre_id = $4
+       WHERE project_id = $5
+         AND user_id = $6
+         AND deleted_date IS NULL
+       RETURNING project_id, user_id, title, description, visibility, genre_id`,
+      [
+        String(title).trim(),
+        description ? String(description).trim() : null,
+        finalVisibility,
+        finalGenreId,
+        projectId,
+        ownerId,
+      ]
+    );
+
+    if (updateProject.rows.length === 0) {
+      await pool.query('ROLLBACK');
+      return res.status(404).json({ message: 'Proyecto no encontrado' });
+    }
+
+    await pool.query(
+      `UPDATE musical_archives
+       SET archive_name = $1
+       WHERE project_id = $2
+         AND user_id = $3`,
+      [String(title).trim(), projectId, ownerId]
+    );
+
+    await replaceProjectTags(projectId, finalTags);
+    const linkedCollaborators = await replaceProjectCollaborators(projectId, ownerId, collaboratorIds);
+
+    await pool.query('COMMIT');
+
+    return res.status(200).json({
+      message: 'Metadata actualizada correctamente',
+      project: updateProject.rows[0],
+      collaborators: linkedCollaborators,
+    });
+  } catch (error) {
+    try {
+      await pool.query('ROLLBACK');
+    } catch {}
+    console.error('Error actualizando metadata del proyecto:', error);
+    return res.status(500).json({ message: 'Error interno del servidor', error: error.message });
+  }
+});
+
+app.get('/api/notifications/:user_id', async (req, res) => {
+  const userId = Number(req.params.user_id);
+
+  if (!Number.isInteger(userId)) {
+    return res.status(400).json({ message: 'user_id debe ser un numero valido' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         cn.notification_id,
+         cn.project_id,
+         cn.collaborator_id,
+         cn.sender_user_id,
+         cn.recipient_user_id,
+         cn.status,
+         cn.created_at,
+         cn.responded_at,
+         p.title AS project_title,
+         sender.username AS sender_username,
+         COALESCE(c.name, recipient.username) AS collaborator_name
+       FROM collaboration_notifications cn
+       JOIN projects p ON p.project_id = cn.project_id
+       JOIN users sender ON sender.user_id = cn.sender_user_id
+       JOIN users recipient ON recipient.user_id = cn.recipient_user_id
+       LEFT JOIN collaborators c ON c.collaborator_id = cn.collaborator_id
+       WHERE cn.recipient_user_id = $1
+       ORDER BY
+         CASE WHEN cn.status = 'PENDING' THEN 0 ELSE 1 END,
+         cn.created_at DESC`,
+      [userId]
+    );
+
+    return res.status(200).json(result.rows);
+  } catch (error) {
+    console.error('Error listando notificaciones:', error);
+    return res.status(500).json({ message: 'Error interno del servidor', error: error.message });
+  }
+});
+
+app.post('/api/notifications/:notification_id/respond', async (req, res) => {
+  const notificationId = Number(req.params.notification_id);
+  const { user_id, action } = req.body || {};
+  const recipientUserId = Number(user_id);
+  const normalizedAction = action === 'accept' ? 'ACCEPTED' : action === 'reject' ? 'REJECTED' : null;
+
+  if (!Number.isInteger(notificationId) || !Number.isInteger(recipientUserId) || !normalizedAction) {
+    return res.status(400).json({ message: 'notification_id, user_id y action son obligatorios' });
+  }
+
+  try {
+    await pool.query('BEGIN');
+
+    const notificationResult = await pool.query(
+      `SELECT notification_id, project_id, collaborator_id, recipient_user_id, status
+       FROM collaboration_notifications
+       WHERE notification_id = $1
+         AND recipient_user_id = $2
+       LIMIT 1`,
+      [notificationId, recipientUserId]
+    );
+
+    if (notificationResult.rows.length === 0) {
+      await pool.query('ROLLBACK');
+      return res.status(404).json({ message: 'Notificacion no encontrada' });
+    }
+
+    const notification = notificationResult.rows[0];
+
+    if (notification.status !== 'PENDING') {
+      await pool.query('ROLLBACK');
+      return res.status(400).json({ message: 'Esta invitacion ya fue respondida' });
+    }
+
+    await pool.query(
+      `UPDATE project_collaborators
+       SET status = $1,
+           response_date = NOW()
+       WHERE project_id = $2
+         AND collaborator_id = $3`,
+      [normalizedAction, notification.project_id, notification.collaborator_id]
+    );
+
+    const updatedNotification = await pool.query(
+      `UPDATE collaboration_notifications
+       SET status = $1,
+           responded_at = NOW()
+       WHERE notification_id = $2
+       RETURNING notification_id, project_id, collaborator_id, status, responded_at`,
+      [normalizedAction, notificationId]
+    );
+
+    await pool.query('COMMIT');
+
+    return res.status(200).json({
+      message: normalizedAction === 'ACCEPTED' ? 'Invitacion aceptada' : 'Invitacion rechazada',
+      notification: updatedNotification.rows[0],
+    });
+  } catch (error) {
+    try {
+      await pool.query('ROLLBACK');
+    } catch {}
+    console.error('Error respondiendo notificacion:', error);
+    return res.status(500).json({ message: 'Error interno del servidor', error: error.message });
   }
 });
 
@@ -1007,6 +1372,8 @@ app.get('/api/users/:user_id/followers', async (req, res) => {
   const userId = Number(req.params.user_id);
   const limit = Math.max(1, Math.min(Number(req.query.limit) || 30, 100));
   const offset = Math.max(0, Number(req.query.offset) || 0);
+  const search = String(req.query.search || '').trim();
+  const searchPattern = search ? `%${search}%` : '';
 
   if (!Number.isInteger(userId)) {
     return res.status(400).json({ message: 'user_id debe ser un número válido' });
@@ -1022,9 +1389,10 @@ app.get('/api/users/:user_id/followers', async (req, res) => {
        FROM user_follows uf
        JOIN users u ON u.user_id = uf.follower_id
        WHERE uf.following_id = $1
+         AND ($4 = '' OR u.username ILIKE $4)
        ORDER BY uf.created_at DESC
        LIMIT $2 OFFSET $3`,
-      [userId, limit, offset]
+      [userId, limit, offset, searchPattern]
     );
 
     return res.status(200).json(result.rows);
@@ -1123,7 +1491,21 @@ app.get('/api/video-detail/:project_id', async (req, res) => {
            FROM project_tags pt
            JOIN tags t ON t.tag_id = pt.tag_id
            WHERE pt.project_id = p.project_id
-         ), '[]'::json) AS tags
+         ), '[]'::json) AS tags,
+         COALESCE((
+           SELECT json_agg(
+             json_build_object(
+               'user_id', follower.user_id,
+               'username', follower.username
+             )
+             ORDER BY follower.username
+           )
+           FROM project_collaborators pc
+           JOIN collaborators c ON c.collaborator_id = pc.collaborator_id
+           JOIN users follower ON LOWER(follower.username) = LOWER(c.name)
+           WHERE pc.project_id = p.project_id
+             AND pc.status = 'ACCEPTED'
+         ), '[]'::json) AS collaborators
        FROM projects p
        JOIN users u ON u.user_id = p.user_id
        JOIN LATERAL (
