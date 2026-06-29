@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -6,8 +7,6 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const BACKEND_DIR = path.join(__dirname, '..');
-const UPLOADS_DIR = path.join(BACKEND_DIR, 'uploads');
-const WAVEFORMS_DIR = path.join(UPLOADS_DIR, 'waveforms');
 const SCRIPT_PATH = path.join(BACKEND_DIR, 'scripts', 'generate_waveform.py');
 const DEFAULT_PYTHON_312 = process.env.LOCALAPPDATA
   ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Python', 'Python312', 'python.exe')
@@ -57,32 +56,63 @@ class AudioWaveformService {
     return { command: 'python', baseArgs: [] };
   }
 
-  async generateForUpload(fileData, options = {}) {
-    if (!fileData?.filename) return null;
+  async generateForUpload(file, options = {}) {
+    if (!file?.buffer || !file?.originalname) return null;
 
-    const inputPath = path.join(UPLOADS_DIR, fileData.filename);
-    if (!fs.existsSync(inputPath)) {
-      throw new Error(`No se encontro el archivo para generar waveform: ${fileData.filename}`);
-    }
-
-    const baseName = path.parse(fileData.filename).name;
-    const outputFilename = `${baseName}.waveform.json`;
-    const outputPath = path.join(WAVEFORMS_DIR, outputFilename);
     const pointCount = Number(options.points) || 800;
     const { command, baseArgs } = this.getPythonCommand();
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'harawi-waveform-'));
+    const inputFilename = `${Date.now()}-${path.basename(file.originalname)}`;
+    const inputPath = path.join(tempDir, inputFilename);
+    const baseName = path.parse(file.originalname).name;
+    const outputFilename = `${baseName}.waveform.json`;
 
-    const stdout = await runPython(command, [
-      ...baseArgs,
-      SCRIPT_PATH,
-      inputPath,
-      '--points',
-      String(pointCount),
-    ]);
+    try {
+      fs.writeFileSync(inputPath, file.buffer);
 
-    const waveform = JSON.parse(stdout.trim());
-    fs.writeFileSync(outputPath, JSON.stringify(waveform));
+      let stdout;
+      try {
+        stdout = await runPython(command, [
+          ...baseArgs,
+          SCRIPT_PATH,
+          inputPath,
+          '--points',
+          String(pointCount),
+        ]);
+      } catch (error) {
+        console.warn('No se pudo generar waveform para el audio:', error.message);
+        return null;
+      }
 
-    return `/uploads/waveforms/${outputFilename}`;
+      let waveform;
+      try {
+        waveform = JSON.parse(stdout.trim());
+      } catch (error) {
+        console.warn('El script de waveform no devolvio JSON valido:', error.message);
+        return null;
+      }
+      const waveformBuffer = Buffer.from(JSON.stringify(waveform));
+
+      if (options.storageService) {
+        const uploadedWaveform = await options.storageService.uploadGeneratedFile({
+          buffer: waveformBuffer,
+          originalName: outputFilename,
+          mimetype: 'application/json',
+          folder: options.folder || 'waveforms',
+        });
+
+        return uploadedWaveform.url;
+      }
+
+      const outputDir = path.join(BACKEND_DIR, 'uploads', options.folder || 'waveforms');
+      const outputPath = path.join(outputDir, outputFilename);
+      fs.mkdirSync(outputDir, { recursive: true });
+      fs.writeFileSync(outputPath, waveformBuffer);
+
+      return `/uploads/${(options.folder || 'waveforms').replace(/\\/g, '/')}/${outputFilename}`;
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   }
 }
 

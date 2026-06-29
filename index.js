@@ -630,6 +630,8 @@ app.get('/api/verify/:token', async (req, res) => {
  * Se espera un campo 'file' en el form-data y opcionalmente 'user_id'
  */
 app.post('/api/upload', upload.single('file'), async (req, res) => {
+  const uploadedUrls = [];
+
   try {
     if (!req.file) {
       return res.status(400).json({ message: 'No se subió ningún archivo' });
@@ -639,9 +641,13 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 
     // 1. Guardar archivo físicamente (Local o S3)
     const fileData = await storageService.uploadFile(req.file);
+    uploadedUrls.push(fileData.url);
     let waveformUrl = null;
-    if (audioWaveformService.isAudio(req.file) && fileData.storageType === 'local') {
-      waveformUrl = await audioWaveformService.generateForUpload(fileData);
+    if (audioWaveformService.isAudio(req.file)) {
+      waveformUrl = await audioWaveformService.generateForUpload(req.file, { storageService });
+      if (waveformUrl) {
+        uploadedUrls.push(waveformUrl);
+      }
     }
 
     // 2. Guardar metadata en la base de datos
@@ -668,6 +674,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 
   } catch (error) {
     console.error('Error subiendo archivo:', error);
+    await storageService.deleteFiles(uploadedUrls);
     res.status(500).json({ message: 'Error interno del servidor', error: error.message });
   }
 });
@@ -677,12 +684,18 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
  */
 app.post('/api/musical-archives', upload.fields([{ name: 'archive', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
   let uploadKey = null;
+  const uploadedUrls = [];
 
   try {
     const { user_id, archive_name, description, privacy, genre_id, tags, collaborators } = req.body;
+    const finalUserId = Number(user_id);
 
     if (!user_id) {
       return res.status(400).json({ message: 'user_id es obligatorio para subir un archivo musical' });
+    }
+
+    if (Number.isNaN(finalUserId)) {
+      return res.status(400).json({ message: 'user_id no es valido' });
     }
     
     if (!req.files || !req.files.archive) {
@@ -710,13 +723,18 @@ app.post('/api/musical-archives', upload.fields([{ name: 'archive', maxCount: 1 
 
     // 1. Guardar archivos físicamente
     const archiveData = await storageService.uploadFile(archiveFile);
+    uploadedUrls.push(archiveData.url);
     let thumbnailData = null;
     if (thumbnailFile) {
-      thumbnailData = await storageService.uploadFile(thumbnailFile);
+      thumbnailData = await storageService.uploadFile(thumbnailFile, { folder: 'thumbnails' });
+      uploadedUrls.push(thumbnailData.url);
     }
     let waveformUrl = null;
-    if (archive_type === 'AUDIO' && archiveData.storageType === 'local') {
-      waveformUrl = await audioWaveformService.generateForUpload(archiveData);
+    if (archive_type === 'AUDIO') {
+      waveformUrl = await audioWaveformService.generateForUpload(archiveFile, { storageService });
+      if (waveformUrl) {
+        uploadedUrls.push(waveformUrl);
+      }
     }
 
     const parsedTags = parseTags(tags);
@@ -729,11 +747,6 @@ app.post('/api/musical-archives', upload.fields([{ name: 'archive', maxCount: 1 
     // Normalizamos al formato que suele exigir el CHECK de la tabla projects.
     const finalVisibility = privacy === 'private' ? 'PRIVATE' : 'PUBLIC';
     const finalGenreId = genre_id ? Number(genre_id) : null;
-    const finalUserId = Number(user_id);
-
-    if (Number.isNaN(finalUserId)) {
-      return res.status(400).json({ message: 'user_id no es valido' });
-    }
 
     // 2. Crear proyecto con la metadata principal
     const projectResult = await pool.query(
@@ -787,6 +800,7 @@ app.post('/api/musical-archives', upload.fields([{ name: 'archive', maxCount: 1 
       console.error('Error haciendo rollback:', rollbackError);
     }
     console.error('Error subiendo archivo musical:', error);
+    await storageService.deleteFiles(uploadedUrls);
     res.status(500).json({ message: 'Error interno del servidor', error: error.message });
   } finally {
     if (uploadKey) {
@@ -1598,6 +1612,7 @@ app.post('/api/projects/:project_id/comments', async (req, res) => {
  */
 app.post('/api/users/:user_id/profile-picture', upload.single('profile_picture'), async (req, res) => {
   const { user_id } = req.params;
+  let uploadedFileUrl = null;
 
   try {
     if (!req.file) {
@@ -1610,7 +1625,8 @@ app.post('/api/users/:user_id/profile-picture', upload.single('profile_picture')
     }
 
     // 1. Guardar archivo físicamente
-    const fileData = await storageService.uploadFile(req.file);
+    const fileData = await storageService.uploadFile(req.file, { folder: 'profile-pictures' });
+    uploadedFileUrl = fileData.url;
 
     // 2. Registrar en la tabla files (opcional, para llevar registro de todas las fotos subidas)
     await pool.query(
@@ -1626,6 +1642,9 @@ app.post('/api/users/:user_id/profile-picture', upload.single('profile_picture')
     );
 
     if (updatedUser.rows.length === 0) {
+      if (uploadedFileUrl) {
+        await storageService.deleteFiles([uploadedFileUrl]);
+      }
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
 
@@ -1636,6 +1655,9 @@ app.post('/api/users/:user_id/profile-picture', upload.single('profile_picture')
 
   } catch (error) {
     console.error('Error subiendo foto de perfil:', error);
+    if (uploadedFileUrl) {
+      await storageService.deleteFiles([uploadedFileUrl]);
+    }
     res.status(500).json({ message: 'Error interno del servidor', error: error.message });
   }
 });
@@ -1645,6 +1667,7 @@ app.post('/api/users/:user_id/profile-picture', upload.single('profile_picture')
  */
 app.post('/api/users/:user_id/cover-picture', upload.single('cover_picture'), async (req, res) => {
   const { user_id } = req.params;
+  let uploadedFileUrl = null;
 
   try {
     if (!req.file) {
@@ -1657,7 +1680,8 @@ app.post('/api/users/:user_id/cover-picture', upload.single('cover_picture'), as
     }
 
     // 1. Guardar archivo físicamente
-    const fileData = await storageService.uploadFile(req.file);
+    const fileData = await storageService.uploadFile(req.file, { folder: 'cover-pictures' });
+    uploadedFileUrl = fileData.url;
 
     // 2. Registrar en la tabla files (opcional)
     await pool.query(
@@ -1673,6 +1697,9 @@ app.post('/api/users/:user_id/cover-picture', upload.single('cover_picture'), as
     );
 
     if (updatedUser.rows.length === 0) {
+      if (uploadedFileUrl) {
+        await storageService.deleteFiles([uploadedFileUrl]);
+      }
       return res.status(404).json({ message: 'Usuario no encontrado' });
     }
 
@@ -1683,6 +1710,9 @@ app.post('/api/users/:user_id/cover-picture', upload.single('cover_picture'), as
 
   } catch (error) {
     console.error('Error subiendo foto de portada:', error);
+    if (uploadedFileUrl) {
+      await storageService.deleteFiles([uploadedFileUrl]);
+    }
     res.status(500).json({ message: 'Error interno del servidor', error: error.message });
   }
 });
