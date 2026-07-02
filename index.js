@@ -1154,6 +1154,16 @@ app.delete('/api/projects/:project_id', async (req, res) => {
 app.get('/api/videos/recommended', async (req, res) => {
   const limit = Number(req.query.limit) || 20;
   const safeLimit = Math.max(1, Math.min(limit, 60));
+  const requestedType = String(req.query.type || '').toUpperCase();
+  const archiveTypes = ['AUDIO', 'VIDEO'].includes(requestedType)
+    ? [requestedType]
+    : ['AUDIO', 'VIDEO'];
+  const excludeProjectId = Number(req.query.exclude_project_id);
+  const queryParams = [archiveTypes];
+  const excludeCondition = Number.isNaN(excludeProjectId)
+    ? ''
+    : `AND p.project_id <> $${queryParams.push(excludeProjectId)}`;
+  const limitPlaceholder = `$${queryParams.push(safeLimit)}`;
 
   try {
     const result = await pool.query(
@@ -1173,11 +1183,12 @@ app.get('/api/videos/recommended', async (req, res) => {
          WHERE project_id = p.project_id
          LIMIT 1
        ) ma ON TRUE
-       WHERE ma.archive_type IN ('AUDIO', 'VIDEO')
+       WHERE ma.archive_type = ANY($1)
          AND p.deleted_date IS NULL
+         ${excludeCondition}
        ORDER BY RANDOM()
-       LIMIT $1`,
-      [safeLimit]
+       LIMIT ${limitPlaceholder}`,
+      queryParams
     );
 
     res.json(result.rows);
