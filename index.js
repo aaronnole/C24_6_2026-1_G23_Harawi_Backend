@@ -20,6 +20,7 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || 'https://harawi.duckdns.org').replace(/\/+$/, '');
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
   cors: {
@@ -228,7 +229,7 @@ app.post('/api/register', async (req, res) => {
     );
 
     // 5. Enviar correo de verificación
-    const verificationLink = `http://localhost:3001/api/verify/${verificationToken}`;
+    const verificationLink = `${PUBLIC_BASE_URL}/api/verify/${verificationToken}`;
     
     const mailOptions = {
       from: `"Harawi Support" <${process.env.EMAIL_USER}>`,
@@ -347,7 +348,7 @@ app.post('/api/forgot-password', async (req, res) => {
       [resetToken, user.user_id]
     );
 
-    const resetLink = `http://localhost:5173/reset-password?token=${resetToken}`;
+    const resetLink = `${PUBLIC_BASE_URL}/reset-password?token=${resetToken}`;
 
     const mailOptions = {
       from: `"Harawi Support" <${process.env.EMAIL_USER}>`,
